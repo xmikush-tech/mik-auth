@@ -1,0 +1,222 @@
+web: gunicorn auth_server:app -b 0.0.0.0:$PORT
+
+flask
+gunicorn
+"""
+============================================================================
+ auth_server.py — Mik Cheat Authentication Server
+ 
+ Hostalo su Render / Railway / Replit / qualsiasi VPS.
+ Il cheat fa POST /login con user+pass, il server risponde ok/no.
+ 
+ Endpoints:
+   POST /login          — il cheat chiama questo per autenticarsi
+   POST /admin/add      — aggiungi un utente (protetto da admin key)
+   POST /admin/remove   — rimuovi un utente
+   GET  /admin/list     — lista utenti
+   
+ Setup:
+   pip install flask
+   python auth_server.py
+   
+ Il server gira su porta 5000 di default.
+ In produzione usa gunicorn: gunicorn auth_server:app -b 0.0.0.0:5000
+============================================================================
+"""
+
+from flask import Flask, request, jsonify
+import hashlib
+import json
+import os
+import time
+
+app = Flask(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+# Admin key — cambia questa! Serve per aggiungere/rimuovere utenti.
+ADMIN_KEY = "mik_admin_secret_2026"
+
+# File dove salva gli utenti (JSON)
+USERS_FILE = "users.json"
+
+# ── User database ─────────────────────────────────────────────────────────
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=2)
+
+def hash_password(password):
+    """SHA-256 hash con salt fisso. Non e' bcrypt ma e' meglio di plaintext."""
+    salt = "mik_salt_2026"
+    return hashlib.sha256((salt + password).encode()).hexdigest()
+
+# Crea il file utenti con l'admin se non esiste
+if not os.path.exists(USERS_FILE):
+    default_users = {
+        "mik": {
+            "password_hash": hash_password("mik2026"),
+            "created": time.time(),
+            "active": True
+        }
+    }
+    save_users(default_users)
+    print("[+] Created default user: mik / mik2026")
+
+# ── Endpoints ──────────────────────────────────────────────────────────────
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Il cheat chiama questo endpoint per autenticarsi."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error", "message": "no data"}), 400
+    
+    username = data.get("username", "").strip().lower()
+    password = data.get("password", "")
+    
+    if not username or not password:
+        return jsonify({"status": "error", "message": "missing credentials"}), 400
+    
+    users = load_users()
+    
+    # Check user exists
+    if username not in users:
+        time.sleep(1)  # anti-bruteforce delay
+        return jsonify({"status": "denied", "message": "invalid credentials"}), 401
+    
+    user = users[username]
+    
+    # Check if account is active
+    if not user.get("active", True):
+        return jsonify({"status": "denied", "message": "account disabled"}), 403
+    
+    # Check password
+    if user["password_hash"] != hash_password(password):
+        time.sleep(1)  # anti-bruteforce delay
+        return jsonify({"status": "denied", "message": "invalid credentials"}), 401
+    
+    # Success — update last login
+    users[username]["last_login"] = time.time()
+    save_users(users)
+    
+    print(f"[+] Login OK: {username}")
+    return jsonify({
+        "status": "ok",
+        "message": "access granted",
+        "token": hashlib.sha256(f"{username}{time.time()}{ADMIN_KEY}".encode()).hexdigest()[:32]
+    }), 200
+
+
+@app.route("/admin/add", methods=["POST"])
+def admin_add():
+    """Aggiungi un nuovo utente. Richiede admin key."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error"}), 400
+    
+    if data.get("admin_key") != ADMIN_KEY:
+        return jsonify({"status": "denied", "message": "invalid admin key"}), 403
+    
+    username = data.get("username", "").strip().lower()
+    password = data.get("password", "")
+    
+    if not username or not password:
+        return jsonify({"status": "error", "message": "missing username/password"}), 400
+    
+    users = load_users()
+    
+    if username in users:
+        return jsonify({"status": "error", "message": "user already exists"}), 409
+    
+    users[username] = {
+        "password_hash": hash_password(password),
+        "created": time.time(),
+        "active": True
+    }
+    save_users(users)
+    
+    print(f"[+] User added: {username}")
+    return jsonify({"status": "ok", "message": f"user '{username}' created"}), 201
+
+
+@app.route("/admin/remove", methods=["POST"])
+def admin_remove():
+    """Rimuovi un utente. Richiede admin key."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error"}), 400
+    
+    if data.get("admin_key") != ADMIN_KEY:
+        return jsonify({"status": "denied"}), 403
+    
+    username = data.get("username", "").strip().lower()
+    users = load_users()
+    
+    if username not in users:
+        return jsonify({"status": "error", "message": "user not found"}), 404
+    
+    del users[username]
+    save_users(users)
+    
+    print(f"[-] User removed: {username}")
+    return jsonify({"status": "ok", "message": f"user '{username}' removed"}), 200
+
+
+@app.route("/admin/toggle", methods=["POST"])
+def admin_toggle():
+    """Attiva/disattiva un utente senza cancellarlo."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error"}), 400
+    
+    if data.get("admin_key") != ADMIN_KEY:
+        return jsonify({"status": "denied"}), 403
+    
+    username = data.get("username", "").strip().lower()
+    users = load_users()
+    
+    if username not in users:
+        return jsonify({"status": "error", "message": "user not found"}), 404
+    
+    users[username]["active"] = not users[username].get("active", True)
+    save_users(users)
+    
+    state = "enabled" if users[username]["active"] else "disabled"
+    print(f"[~] User {username}: {state}")
+    return jsonify({"status": "ok", "message": f"user '{username}' is now {state}"}), 200
+
+
+@app.route("/admin/list", methods=["GET"])
+def admin_list():
+    """Lista tutti gli utenti. Richiede admin key come query param."""
+    if request.args.get("key") != ADMIN_KEY:
+        return jsonify({"status": "denied"}), 403
+    
+    users = load_users()
+    user_list = []
+    for name, info in users.items():
+        user_list.append({
+            "username": name,
+            "active": info.get("active", True),
+            "last_login": info.get("last_login", None)
+        })
+    
+    return jsonify({"status": "ok", "users": user_list}), 200
+
+
+# ── Run ───────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("========================================")
+    print("  Mik Auth Server")
+    print("  Port: 5000")
+    print(f"  Admin Key: {ADMIN_KEY}")
+    print("========================================")
+    app.run(host="0.0.0.0", port=5000, debug=False)
